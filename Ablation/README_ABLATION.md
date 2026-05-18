@@ -19,14 +19,20 @@ Default settings:
 ```text
 SEED=3003
 NUM_UPDATES=300
-PYTHON_BIN=/home/npg/miniconda3/envs/maojie/bin/python
+python = current conda environment python
 ```
 
 Override example:
 
 ```bash
-PYTHON_BIN=/path/to/conda/env/bin/python SEED=3004 NUM_UPDATES=300 ./all_run.sh
+conda activate maojie
+SEED=3004 NUM_UPDATES=300 ./all_run.sh
 ```
+
+
+`all_run.sh` intentionally uses plain `python`. Activate the desired conda environment before running it.
+
+The top-level path is a symlink to `/data/Maojie/Github2/OFFLINE2ONLINE/Ablation` in this machine; both paths point to the same package.
 
 ## GPU layout
 
@@ -48,6 +54,31 @@ incumbent_ratio=0.20
 n_traj=50
 test_agent=8
 ```
+
+
+## Reference gate support
+
+This package includes the latest adaptive reference-advantage gate code. `train_incumbent.py` now accepts:
+
+```text
+--reference-adv-gate-mode fixed|linear|hard
+--reference-adv-gate-temp 0.05
+--reference-adv-hard-threshold 0.03
+```
+
+The default `all_run.sh` ablation still runs the fixed-ref coefficient/rho sweep. To run P3-style gate experiments, add these flags to the corresponding `train_incumbent.py` command or launcher.
+
+
+## P4 entry point
+
+P4 best-archive reference experiments are configured in this package:
+
+```bash
+conda activate maojie
+./auto_run_p4.sh
+```
+
+See `README_P4.md` for the GPU layout and reference-source definitions.
 
 ## Outputs
 

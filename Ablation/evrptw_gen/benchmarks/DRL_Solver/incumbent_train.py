@@ -119,6 +119,55 @@ def _incumbent_obj(record):
         return float("inf")
 
 
+def _teacher_obj(record):
+    value = record.get("teacher_obj", record.get("incumbent_obj", float("inf")))
+    try:
+        return float(value)
+    except Exception:
+        return float("inf")
+
+
+def _policy_archive_obj(record):
+    candidates = [
+        record.get("policy_best_obj", float("inf")),
+        record.get("student_best_obj", float("inf")),
+    ]
+    finite = []
+    for value in candidates:
+        try:
+            value = float(value)
+        except Exception:
+            continue
+        if np.isfinite(value) and value > 0.0:
+            finite.append(value)
+    return min(finite) if finite else float("inf")
+
+
+def _reference_obj_for_record(record, args):
+    if record is None:
+        return float("nan")
+    source = str(getattr(args, "reference_adv_source", "incumbent")).lower()
+    teacher = _teacher_obj(record)
+    incumbent = _incumbent_obj(record)
+    policy_archive = _policy_archive_obj(record)
+    if source == "teacher":
+        return teacher
+    if source == "policy":
+        return policy_archive
+    if source == "best_archive":
+        return min(teacher, incumbent, policy_archive)
+    return incumbent
+
+
+def _parse_state_set(text):
+    if text is None:
+        return set()
+    text = str(text).strip()
+    if not text:
+        return set()
+    return {part.strip().lower() for part in text.split(",") if part.strip()}
+
+
 def _incumbent_action_sequence(record, args):
     seq = record.get("incumbent_action_sequence", None)
     if seq is None:
@@ -182,9 +231,13 @@ def _classify_policy_vs_incumbent(record, objectives, args):
 def _reference_allowed_for_record(record, args):
     if record is None:
         return False
+    state = str(record.get("regret_state", "unknown")).lower()
+    allowed_states = _parse_state_set(getattr(args, "reference_adv_allow_states", ""))
+    if allowed_states:
+        return state in allowed_states
     if not bool(getattr(args, "reference_adv_alns_win_only", False)):
         return True
-    return str(record.get("regret_state", "unknown")) == "stable_alns_win"
+    return state == "stable_alns_win"
 
 
 def _initialize_incumbent_records(records, args):
@@ -456,7 +509,7 @@ def _reset_envs_for_rollout(envs, records_meta, group_meta, args, rng):
             np.asarray(getattr(base_env, "teacher_suffix_obj", np.full(args.n_traj, np.nan)), dtype=np.float32)
         )
         teacher_obj.append(float(record.get("teacher_obj", _incumbent_obj(record))) if record is not None else np.nan)
-        reference_obj.append(_incumbent_obj(record) if record is not None else np.nan)
+        reference_obj.append(_reference_obj_for_record(record, args) if record is not None else np.nan)
         is_buffer.append(record is not None)
         is_prefix.append(used_prefix)
         prefix_len.append(int(getattr(base_env, "prefix_len", 0)))
@@ -670,6 +723,16 @@ def _masked_std(tensor, mask):
     return float(std.detach().cpu().item())
 
 
+def _masked_mean(tensor, mask):
+    vals = tensor[mask]
+    if vals.numel() == 0:
+        return 0.0
+    mean = vals.float().mean()
+    if not torch.isfinite(mean):
+        return 0.0
+    return float(mean.detach().cpu().item())
+
+
 def _comparative_suffix_advantage(rollout, args):
     objectives = rollout["objectives"]
     prefix_objective = rollout.get("prefix_objective", None)
@@ -711,7 +774,7 @@ def _reference_conditioned_advantage(rollout, args):
     reference_allowed = rollout.get("reference_allowed", None)
     if reference_obj is None or is_offline is None:
         zero = torch.zeros_like(objectives)
-        return zero, zero
+        return zero, zero, zero
 
     ref = reference_obj.to(objectives.device, dtype=objectives.dtype).unsqueeze(1)
     denom = (float(args.reference_adv_rho) * ref.abs()).clamp_min(1e-8)
@@ -722,8 +785,25 @@ def _reference_conditioned_advantage(rollout, args):
         allow = reference_allowed.to(objectives.device).unsqueeze(1)
     valid = allow & is_offline.to(objectives.device).unsqueeze(1) & torch.isfinite(objectives) & torch.isfinite(ref) & (ref > 0.0)
     raw = torch.where(valid, raw, torch.zeros_like(raw))
-    used = raw.clamp(-float(args.reference_adv_clip), float(args.reference_adv_clip))
-    return raw, used
+    clipped = raw.clamp(-float(args.reference_adv_clip), float(args.reference_adv_clip))
+
+    mode = str(getattr(args, "reference_adv_gate_mode", "fixed")).lower()
+    if mode == "linear":
+        finite_obj = torch.where(torch.isfinite(objectives), objectives, torch.full_like(objectives, float("inf")))
+        best = finite_obj.min(dim=1).values.unsqueeze(1)
+        regret_rel = (best - ref) / ref.abs().clamp_min(1e-8)
+        gate = (regret_rel / max(float(args.reference_adv_gate_temp), 1e-8)).clamp(0.0, 1.0)
+    elif mode == "hard":
+        finite_obj = torch.where(torch.isfinite(objectives), objectives, torch.full_like(objectives, float("inf")))
+        best = finite_obj.min(dim=1).values.unsqueeze(1)
+        regret_rel = (best - ref) / ref.abs().clamp_min(1e-8)
+        gate = (regret_rel > float(args.reference_adv_hard_threshold)).to(objectives.dtype)
+    else:
+        gate = torch.ones((objectives.shape[0], 1), device=objectives.device, dtype=objectives.dtype)
+    gate = torch.where(valid.any(dim=1, keepdim=True), gate, torch.zeros_like(gate))
+    gate = gate.expand_as(objectives)
+    used = clipped * gate
+    return raw, used, gate
 
 
 def _effective_group_adv_coef(args):
@@ -874,6 +954,7 @@ def _compute_gae_and_returns(agent, rollout, args, device):
     cmp_used = torch.zeros_like(rollout["objectives"])
     ref_raw = torch.zeros_like(rollout["objectives"])
     ref_used = torch.zeros_like(rollout["objectives"])
+    ref_gate = torch.zeros_like(rollout["objectives"])
 
     group_coef = _effective_group_adv_coef(args)
     if group_coef > 0:
@@ -882,7 +963,7 @@ def _compute_gae_and_returns(agent, rollout, args, device):
         actor_advantages = actor_advantages + group_contrib
 
     if float(getattr(args, "reference_adv_coef", 0.0)) > 0:
-        ref_raw, ref_used = _reference_conditioned_advantage(rollout, args)
+        ref_raw, ref_used, ref_gate = _reference_conditioned_advantage(rollout, args)
         ref_contrib = float(args.reference_adv_coef) * ref_used.unsqueeze(0)
         actor_advantages = actor_advantages + ref_contrib
 
@@ -899,6 +980,7 @@ def _compute_gae_and_returns(agent, rollout, args, device):
     adv_parts["rank_contrib"] = adv_parts["group_contrib"]
     adv_parts["ref_raw"] = ref_raw.unsqueeze(0).expand_as(actor_advantages) * valid_masks
     adv_parts["ref_used"] = ref_used.unsqueeze(0).expand_as(actor_advantages) * valid_masks
+    adv_parts["ref_gate"] = ref_gate.unsqueeze(0).expand_as(actor_advantages) * valid_masks
     adv_parts["ref_contrib"] = ref_contrib * valid_masks
     adv_parts["cmp_raw"] = cmp_raw.unsqueeze(0).expand_as(actor_advantages) * valid_masks
     adv_parts["cmp_used"] = cmp_used.unsqueeze(0).expand_as(actor_advantages) * valid_masks
@@ -1202,7 +1284,11 @@ def _update_incumbents_from_rollout(records_meta, envs, rollout, args, online_bu
                 record["student_regret"] = student_obj - incumbent_obj if np.isfinite(student_obj) else incumbent_obj
                 record["student_regret_known"] = True
             record["student_action_sequence"] = list(full_seq)
-            if np.isfinite(student_obj) and student_obj + float(args.incumbent_update_eps) < incumbent_obj:
+            if (
+                bool(getattr(args, "allow_incumbent_updates", True))
+                and np.isfinite(student_obj)
+                and student_obj + float(args.incumbent_update_eps) < incumbent_obj
+            ):
                 record["incumbent_obj"] = student_obj
                 record["incumbent_action_sequence"] = list(full_seq)
                 record["incumbent_source"] = "policy"
@@ -1530,6 +1616,7 @@ def _print_update_summary(update_step, args, rollout, ppo_info, aux_info, archiv
         f"group={adv_debug.get('group_contrib_std', adv_debug.get('rank_contrib_std', 0.0)):.3f} "
         f"ref_raw={adv_debug.get('ref_raw_std', 0.0):.3f} "
         f"ref_used={adv_debug.get('ref_used_std', 0.0):.3f} "
+        f"ref_gate={adv_debug.get('ref_gate_mean', 0.0):.3f}/{adv_debug.get('ref_gate_active', 0.0):.3f} "
         f"ref={adv_debug.get('ref_contrib_std', 0.0):.3f} "
         f"cmp_raw={adv_debug.get('cmp_raw_std', 0.0):.3f} "
         f"cmp_used={adv_debug.get('cmp_used_std', 0.0):.3f} "
@@ -1930,6 +2017,12 @@ def parse_args():
     parser.add_argument("--reference-adv-rho", type=float, default=0.05)
     parser.add_argument("--reference-adv-clip", type=float, default=2.0)
     parser.add_argument("--reference-adv-alns-win-only", type=str2bool, default=False, nargs="?", const=True)
+    parser.add_argument("--reference-adv-allow-states", type=str, default="")
+    parser.add_argument("--reference-adv-source", type=str, default="incumbent", choices=["teacher", "incumbent", "best_archive", "policy"])
+    parser.add_argument("--allow-incumbent-updates", type=str2bool, default=True, nargs="?", const=True)
+    parser.add_argument("--reference-adv-gate-mode", type=str, default="fixed", choices=["fixed", "linear", "hard"])
+    parser.add_argument("--reference-adv-gate-temp", type=float, default=0.05)
+    parser.add_argument("--reference-adv-hard-threshold", type=float, default=0.03)
     parser.add_argument("--cmp-adv-coef", type=float, default=0.0)
     parser.add_argument("--cmp-adv-clip", type=float, default=3.0)
     parser.add_argument("--cmp-adv-mode", type=str, default="raw", choices=["raw", "gap_temp"])
@@ -1988,6 +2081,8 @@ def parse_args():
         raise ValueError("cmp_gap_temp, cmp_adv_clip and cmp_raw_clip must be positive.")
     if args.group_adv_clip <= 0 or args.reference_adv_rho <= 0 or args.reference_adv_clip <= 0:
         raise ValueError("group_adv_clip, reference_adv_rho and reference_adv_clip must be positive.")
+    if args.reference_adv_gate_temp <= 0 or args.reference_adv_hard_threshold < 0:
+        raise ValueError("reference_adv_gate_temp must be positive and reference_adv_hard_threshold must be non-negative.")
     if args.grad_cos_freq <= 0:
         raise ValueError("grad_cos_freq must be positive.")
     for name in (

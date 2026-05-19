@@ -80,6 +80,17 @@ conda activate maojie
 
 See `README_P4.md` for the GPU layout and reference-source definitions.
 
+## P5 entry point
+
+P5 sampler experiments are configured in this package:
+
+```bash
+conda activate maojie
+SEED=3003 NUM_UPDATES=300 ./auto_run_p5.sh
+```
+
+P5 fixes `best_archive + linear gate + rho=0.10`, then ablates only the archive sampler across GPU0-3. See `README_P5.md`.
+
 ## Outputs
 
 For `SEED=3003` and `NUM_UPDATES=300`:

@@ -1001,6 +1001,8 @@ def _compute_gae_and_returns(agent, rollout, args, device):
             "rank_contrib_std": _masked_std(adv_parts["rank_contrib"], mask),
             "ref_raw_std": _masked_std(adv_parts["ref_raw"], mask),
             "ref_used_std": _masked_std(adv_parts["ref_used"], mask),
+            "ref_gate_mean": _masked_mean(adv_parts["ref_gate"], mask),
+            "ref_gate_active": _masked_mean((adv_parts["ref_gate"] > 1e-8).to(torch.float32), mask),
             "ref_contrib_std": _masked_std(adv_parts["ref_contrib"], mask),
             "cmp_raw_std": _masked_std(adv_parts["cmp_raw"], mask),
             "cmp_used_std": _masked_std(adv_parts["cmp_used"], mask),

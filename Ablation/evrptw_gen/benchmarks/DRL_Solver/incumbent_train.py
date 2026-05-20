@@ -24,7 +24,6 @@ from evrptw_gen.benchmarks.DRL_Solver.train import (
     _extract_objectives_from_info,
     _extract_reward_component_stack,
     _load_alns_buffer_from_dir,
-    _record_normalized_dist_matrix,
     _run_evaluation,
     _scheduled_train_configs_for_batch,
 )
@@ -120,163 +119,6 @@ def _incumbent_obj(record):
         return float("inf")
 
 
-def _teacher_obj(record):
-    value = record.get("teacher_obj", record.get("incumbent_obj", float("inf")))
-    try:
-        return float(value)
-    except Exception:
-        return float("inf")
-
-
-def _policy_archive_obj(record):
-    candidates = [
-        record.get("policy_best_obj", float("inf")),
-        record.get("student_best_obj", float("inf")),
-    ]
-    finite = []
-    for value in candidates:
-        try:
-            value = float(value)
-        except Exception:
-            continue
-        if np.isfinite(value) and value > 0.0:
-            finite.append(value)
-    return min(finite) if finite else float("inf")
-
-
-def _reference_obj_for_record(record, args):
-    if record is None:
-        return float("nan")
-    source = str(getattr(args, "reference_adv_source", "incumbent")).lower()
-    teacher = _teacher_obj(record)
-    incumbent = _incumbent_obj(record)
-    policy_archive = _policy_archive_obj(record)
-    if source == "teacher":
-        return teacher
-    if source == "policy":
-        return policy_archive
-    if source == "best_archive":
-        return min(teacher, incumbent, policy_archive)
-    return incumbent
-
-
-
-
-def _candidate_action_sequence(record, args, source):
-    if record is None:
-        return float("inf"), []
-    source = str(source).lower()
-    num_customers = int(args.train_cus_num)
-    num_nodes = int(args.train_cus_num + args.train_cs_num + 1)
-
-    if source == "teacher":
-        seq = record.get("teacher_action_sequence", None)
-        if seq is None:
-            seq = _alns_record_to_action_sequence(record, num_customers=num_customers, num_nodes=num_nodes)
-            if seq:
-                record["teacher_action_sequence"] = list(seq)
-        return _teacher_obj(record), [int(a) for a in list(seq or [])]
-
-    if source == "policy":
-        seq = record.get("student_action_sequence", record.get("policy_action_sequence", None))
-        return _policy_archive_obj(record), [int(a) for a in list(seq or [])]
-
-    seq = _incumbent_action_sequence(record, args)
-    return _incumbent_obj(record), [int(a) for a in list(seq or [])]
-
-
-def _reference_action_sequence_for_record(record, args):
-    if record is None:
-        return []
-    source = str(getattr(args, "reference_adv_source", "incumbent")).lower()
-    if source != "best_archive":
-        _obj, seq = _candidate_action_sequence(record, args, source)
-        return seq
-
-    candidates = []
-    for candidate_source in ("teacher", "incumbent", "policy"):
-        obj, seq = _candidate_action_sequence(record, args, candidate_source)
-        if np.isfinite(obj) and obj > 0.0 and len(seq) > 0:
-            candidates.append((float(obj), candidate_source, seq))
-    if not candidates:
-        return []
-    candidates.sort(key=lambda x: x[0])
-    record["_reference_milestone_source"] = candidates[0][1]
-    return candidates[0][2]
-
-
-def _reference_milestones_for_record(record, args):
-    num_customers = int(args.train_cus_num)
-    milestones = np.full((num_customers + 1,), np.nan, dtype=np.float32)
-    milestones[0] = 0.0
-    if record is None:
-        return milestones
-
-    seq = _reference_action_sequence_for_record(record, args)
-    dist_matrix = _record_normalized_dist_matrix(record)
-    if dist_matrix is None or len(seq) == 0:
-        return milestones
-
-    n_nodes = int(dist_matrix.shape[0])
-    last = 0
-    cumulative = 0.0
-    served = set()
-    served_count = 0
-    for raw_action in seq:
-        try:
-            action = int(raw_action)
-        except Exception:
-            continue
-        if action < 0 or action >= n_nodes:
-            continue
-        cumulative += float(dist_matrix[last, action])
-        if 1 <= action <= num_customers and action not in served:
-            served.add(action)
-            served_count += 1
-            if served_count <= num_customers:
-                milestones[served_count] = float(cumulative)
-            if served_count >= num_customers:
-                break
-        last = action
-    return milestones
-
-
-def _extract_step_info_tensor(info, key, num_envs, n_traj, device, dtype=torch.float32, fill_value=0.0):
-    arr = None
-    if isinstance(info, (list, tuple)):
-        vals = []
-        for item in info:
-            if isinstance(item, dict) and key in item:
-                vals.append(np.asarray(item[key]))
-            else:
-                vals.append(np.full((n_traj,), fill_value, dtype=np.float32))
-        try:
-            arr = np.stack(vals, axis=0)
-        except Exception:
-            arr = None
-    elif isinstance(info, dict) and key in info:
-        arr = np.asarray(info[key])
-
-    if arr is None:
-        return None
-    try:
-        arr = np.asarray(arr)
-        if arr.shape != (num_envs, n_traj):
-            arr = arr.reshape(num_envs, n_traj)
-    except Exception:
-        arr = np.full((num_envs, n_traj), fill_value, dtype=np.float32)
-    return torch.tensor(arr, device=device, dtype=dtype)
-
-
-def _parse_state_set(text):
-    if text is None:
-        return set()
-    text = str(text).strip()
-    if not text:
-        return set()
-    return {part.strip().lower() for part in text.split(",") if part.strip()}
-
-
 def _incumbent_action_sequence(record, args):
     seq = record.get("incumbent_action_sequence", None)
     if seq is None:
@@ -340,13 +182,9 @@ def _classify_policy_vs_incumbent(record, objectives, args):
 def _reference_allowed_for_record(record, args):
     if record is None:
         return False
-    state = str(record.get("regret_state", "unknown")).lower()
-    allowed_states = _parse_state_set(getattr(args, "reference_adv_allow_states", ""))
-    if allowed_states:
-        return state in allowed_states
     if not bool(getattr(args, "reference_adv_alns_win_only", False)):
         return True
-    return state == "stable_alns_win"
+    return str(record.get("regret_state", "unknown")) == "stable_alns_win"
 
 
 def _initialize_incumbent_records(records, args):
@@ -598,8 +436,6 @@ def _reset_envs_for_rollout(envs, records_meta, group_meta, args, rng):
     prefix_len = []
     temperatures = []
     reference_allowed = []
-    reference_milestones = []
-    initial_served_cus = []
 
     for env, record, meta_i in zip(envs.envs, records_meta, group_meta):
         base_env = _unwrap_env(env)
@@ -620,16 +456,12 @@ def _reset_envs_for_rollout(envs, records_meta, group_meta, args, rng):
             np.asarray(getattr(base_env, "teacher_suffix_obj", np.full(args.n_traj, np.nan)), dtype=np.float32)
         )
         teacher_obj.append(float(record.get("teacher_obj", _incumbent_obj(record))) if record is not None else np.nan)
-        reference_obj.append(_reference_obj_for_record(record, args) if record is not None else np.nan)
+        reference_obj.append(_incumbent_obj(record) if record is not None else np.nan)
         is_buffer.append(record is not None)
         is_prefix.append(used_prefix)
         prefix_len.append(int(getattr(base_env, "prefix_len", 0)))
         temperatures.append(float(meta_i.get("temperature", 1.0)))
         reference_allowed.append(_reference_allowed_for_record(record, args))
-        reference_milestones.append(_reference_milestones_for_record(record, args))
-        initial_served_cus.append(
-            np.asarray(getattr(base_env, "served_cus", np.zeros(args.n_traj)), dtype=np.int64)
-        )
 
     meta = {
         "prefix_objective": torch.tensor(np.stack(prefix_objective, axis=0), dtype=torch.float32),
@@ -642,8 +474,6 @@ def _reset_envs_for_rollout(envs, records_meta, group_meta, args, rng):
         "prefix_len": torch.tensor(prefix_len, dtype=torch.long),
         "temperature_by_env": torch.tensor(temperatures, dtype=torch.float32),
         "reference_allowed": torch.tensor(reference_allowed, dtype=torch.bool),
-        "reference_milestones": torch.tensor(np.stack(reference_milestones, axis=0), dtype=torch.float32),
-        "initial_served_cus": torch.tensor(np.stack(initial_served_cus, axis=0), dtype=torch.long),
     }
     return _stack_obs_list(obs_list), meta
 
@@ -718,8 +548,6 @@ def _student_rollout(
     else:
         values = torch.zeros((num_steps, num_envs, args.n_traj), device=device)
     valid_masks = torch.zeros((num_steps, num_envs, args.n_traj), dtype=torch.bool, device=device)
-    served_cus_trace = torch.zeros((num_steps, num_envs, args.n_traj), dtype=torch.long, device=device)
-    objective_so_far = torch.zeros((num_steps, num_envs, args.n_traj), dtype=torch.float32, device=device)
 
     if rollout_meta is None:
         rollout_meta = {}
@@ -775,15 +603,6 @@ def _student_rollout(
         maybe_obj = _extract_objectives_from_info(info, args.n_traj, device)
         if maybe_obj is not None:
             objectives = maybe_obj
-            objective_so_far[step] = maybe_obj
-        else:
-            maybe_step_obj = _extract_step_info_tensor(info, "objective", num_envs, args.n_traj, device, dtype=torch.float32, fill_value=0.0)
-            if maybe_step_obj is not None:
-                objective_so_far[step] = maybe_step_obj
-
-        maybe_served = _extract_step_info_tensor(info, "served_cus", num_envs, args.n_traj, device, dtype=torch.long, fill_value=0.0)
-        if maybe_served is not None:
-            served_cus_trace[step] = maybe_served.long()
 
         next_done = done_tensor.float()
         alive = alive & (~done_tensor)
@@ -801,8 +620,6 @@ def _student_rollout(
         "dones": dones[:valid_step],
         "values": values[:valid_step],
         "valid_masks": valid_masks[:valid_step],
-        "served_cus": served_cus_trace[:valid_step],
-        "objective_so_far": objective_so_far[:valid_step],
         "next_obs": next_obs,
         "next_done": next_done,
         "encoder_state": encoder_state,
@@ -841,6 +658,28 @@ def _trajectory_rank_advantage(objectives, clip_value):
         if torch.isfinite(std) and std > 1e-8:
             rank[env_idx, valid] = (vals.mean() - vals) / (std + 1e-8)
     return rank.clamp(-clip_value, clip_value)
+
+
+def _variance_group_gate(objectives, args):
+    if not bool(getattr(args, "use_variance_group_gate", False)):
+        return torch.ones_like(objectives)
+    gate = torch.zeros_like(objectives)
+    v_min = float(getattr(args, "variance_gate_vmin", 0.005))
+    v_max = float(getattr(args, "variance_gate_vmax", 0.030))
+    denom_span = max(v_max - v_min, 1e-8)
+    for env_idx in range(objectives.shape[0]):
+        obj = objectives[env_idx]
+        valid = torch.isfinite(obj)
+        if valid.sum() <= 1:
+            continue
+        vals = obj[valid]
+        mean_abs = vals.mean().abs().clamp_min(1e-8)
+        spread = vals.std(unbiased=False) / mean_abs
+        if not torch.isfinite(spread):
+            continue
+        gate_value = ((spread - v_min) / denom_span).clamp(0.0, 1.0)
+        gate[env_idx, valid] = gate_value
+    return gate
 
 
 def _masked_std(tensor, mask):
@@ -935,71 +774,6 @@ def _reference_conditioned_advantage(rollout, args):
     used = clipped * gate
     return raw, used, gate
 
-
-
-def _milestone_reference_advantage(rollout, args):
-    valid_masks = rollout["valid_masks"].bool()
-    zero = torch.zeros_like(valid_masks, dtype=torch.float32)
-    if not bool(getattr(args, "use_milestone_reference", False)):
-        return zero, zero, zero
-
-    milestones = rollout.get("reference_milestones", None)
-    served = rollout.get("served_cus", None)
-    objective_so_far = rollout.get("objective_so_far", None)
-    reference_obj = rollout.get("reference_obj", None)
-    is_offline = rollout.get("is_offline", None)
-    reference_allowed = rollout.get("reference_allowed", None)
-    initial_served = rollout.get("initial_served_cus", None)
-    if milestones is None or served is None or objective_so_far is None or reference_obj is None or is_offline is None:
-        return zero, zero, zero
-
-    device = objective_so_far.device
-    dtype = objective_so_far.dtype
-    served_idx = served.to(device=device, dtype=torch.long).clamp(0, int(args.train_cus_num))
-    milestones = milestones.to(device=device, dtype=dtype)
-    steps, num_envs, n_traj = served_idx.shape
-    env_idx = torch.arange(num_envs, device=device).view(1, num_envs, 1).expand(steps, num_envs, n_traj)
-    ref_at_k = milestones[env_idx, served_idx]
-
-    prev_served = torch.zeros_like(served_idx)
-    if initial_served is not None:
-        prev_served[0] = initial_served.to(device=device, dtype=torch.long)
-    if steps > 1:
-        prev_served[1:] = served_idx[:-1]
-    new_customer = served_idx > prev_served
-
-    if str(getattr(args, "milestone_ref_denom", "milestone")).lower() == "reference_obj":
-        ref_base = reference_obj.to(device=device, dtype=dtype).view(1, num_envs, 1).expand_as(ref_at_k).abs()
-    else:
-        ref_base = ref_at_k.abs()
-    denom = (float(args.milestone_ref_rho) * ref_base).clamp_min(1e-8)
-    raw = (ref_at_k - objective_so_far.to(dtype)) / denom
-
-    if reference_allowed is None:
-        allow = is_offline.to(device=device).view(1, num_envs, 1)
-    else:
-        allow = reference_allowed.to(device=device).view(1, num_envs, 1)
-    valid = (
-        valid_masks
-        & allow
-        & is_offline.to(device=device).view(1, num_envs, 1)
-        & new_customer
-        & torch.isfinite(raw)
-        & torch.isfinite(ref_at_k)
-        & (ref_at_k > 0.0)
-    )
-    raw = torch.where(valid, raw, torch.zeros_like(raw))
-    clipped = raw.clamp(-float(args.milestone_ref_clip), float(args.milestone_ref_clip))
-
-    if bool(getattr(args, "milestone_ref_use_ref_gate", True)):
-        _ref_raw, _ref_used, ref_gate = _reference_conditioned_advantage(rollout, args)
-        gate = ref_gate.unsqueeze(0).to(device=device, dtype=dtype)
-        clipped = clipped * gate
-        valid = valid & (gate > 1e-8)
-
-    used = torch.where(valid, clipped, torch.zeros_like(clipped))
-    active = valid.to(dtype)
-    return raw, used, active
 
 def _effective_group_adv_coef(args):
     group_coef = float(getattr(args, "group_adv_coef", 0.0))
@@ -1144,25 +918,24 @@ def _compute_gae_and_returns(agent, rollout, args, device):
     group_contrib = torch.zeros_like(actor_advantages)
     cmp_contrib = torch.zeros_like(actor_advantages)
     ref_contrib = torch.zeros_like(actor_advantages)
-    milestone_contrib = torch.zeros_like(actor_advantages)
     group_adv = torch.zeros_like(rollout["objectives"])
     cmp_raw = torch.zeros_like(rollout["objectives"])
     cmp_used = torch.zeros_like(rollout["objectives"])
     ref_raw = torch.zeros_like(rollout["objectives"])
     ref_used = torch.zeros_like(rollout["objectives"])
     ref_gate = torch.zeros_like(rollout["objectives"])
-    milestone_raw = torch.zeros_like(actor_advantages)
-    milestone_used = torch.zeros_like(actor_advantages)
-    milestone_active = torch.zeros_like(actor_advantages)
+    var_gate = _variance_group_gate(rollout["objectives"], args)
 
     group_coef = _effective_group_adv_coef(args)
     if group_coef > 0:
         group_adv = _trajectory_rank_advantage(rollout["objectives"], float(args.group_adv_clip))
+        group_adv = group_adv * var_gate
         group_contrib = group_coef * group_adv.unsqueeze(0)
         actor_advantages = actor_advantages + group_contrib
 
     if float(getattr(args, "reference_adv_coef", 0.0)) > 0:
         ref_raw, ref_used, ref_gate = _reference_conditioned_advantage(rollout, args)
+        ref_used = ref_used * var_gate
         ref_contrib = float(args.reference_adv_coef) * ref_used.unsqueeze(0)
         actor_advantages = actor_advantages + ref_contrib
 
@@ -1170,11 +943,6 @@ def _compute_gae_and_returns(agent, rollout, args, device):
         cmp_raw, cmp_used = _comparative_suffix_advantage(rollout, args)
         cmp_contrib = float(args.cmp_adv_coef) * cmp_used.unsqueeze(0)
         actor_advantages = actor_advantages + cmp_contrib
-
-    if bool(getattr(args, "use_milestone_reference", False)) and float(getattr(args, "milestone_ref_coef", 0.0)) > 0:
-        milestone_raw, milestone_used, milestone_active = _milestone_reference_advantage(rollout, args)
-        milestone_contrib = float(args.milestone_ref_coef) * milestone_used
-        actor_advantages = actor_advantages + milestone_contrib
 
     final_adv = actor_advantages * valid_masks
     adv_parts["base_actor"] = base_actor * valid_masks
@@ -1185,14 +953,11 @@ def _compute_gae_and_returns(agent, rollout, args, device):
     adv_parts["ref_raw"] = ref_raw.unsqueeze(0).expand_as(actor_advantages) * valid_masks
     adv_parts["ref_used"] = ref_used.unsqueeze(0).expand_as(actor_advantages) * valid_masks
     adv_parts["ref_gate"] = ref_gate.unsqueeze(0).expand_as(actor_advantages) * valid_masks
+    adv_parts["var_gate"] = var_gate.unsqueeze(0).expand_as(actor_advantages) * valid_masks
     adv_parts["ref_contrib"] = ref_contrib * valid_masks
     adv_parts["cmp_raw"] = cmp_raw.unsqueeze(0).expand_as(actor_advantages) * valid_masks
     adv_parts["cmp_used"] = cmp_used.unsqueeze(0).expand_as(actor_advantages) * valid_masks
     adv_parts["cmp_contrib"] = cmp_contrib * valid_masks
-    adv_parts["milestone_raw"] = milestone_raw * valid_masks
-    adv_parts["milestone_used"] = milestone_used * valid_masks
-    adv_parts["milestone_active"] = milestone_active * valid_masks
-    adv_parts["milestone_contrib"] = milestone_contrib * valid_masks
     adv_parts["final"] = final_adv
     rollout["adv_parts"] = {k: v.detach() for k, v in adv_parts.items()}
 
@@ -1211,14 +976,12 @@ def _compute_gae_and_returns(agent, rollout, args, device):
             "ref_used_std": _masked_std(adv_parts["ref_used"], mask),
             "ref_gate_mean": _masked_mean(adv_parts["ref_gate"], mask),
             "ref_gate_active": _masked_mean((adv_parts["ref_gate"] > 1e-8).to(torch.float32), mask),
+            "var_gate_mean": _masked_mean(adv_parts["var_gate"], mask),
+            "var_gate_active": _masked_mean((adv_parts["var_gate"] > 1e-8).to(torch.float32), mask),
             "ref_contrib_std": _masked_std(adv_parts["ref_contrib"], mask),
             "cmp_raw_std": _masked_std(adv_parts["cmp_raw"], mask),
             "cmp_used_std": _masked_std(adv_parts["cmp_used"], mask),
             "cmp_contrib_std": _masked_std(adv_parts["cmp_contrib"], mask),
-            "milestone_raw_std": _masked_std(adv_parts["milestone_raw"], mask),
-            "milestone_used_std": _masked_std(adv_parts["milestone_used"], mask),
-            "milestone_active": _masked_mean(adv_parts["milestone_active"], mask),
-            "milestone_contrib_std": _masked_std(adv_parts["milestone_contrib"], mask),
             "final_std": _masked_std(final_adv, mask),
         }
         if "obj_norm" in adv_parts:
@@ -1235,6 +998,136 @@ def _policy_loss_from_adv(adv, ratio, valid, clip_coef):
     pg1 = -adv * ratio
     pg2 = -adv * torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef)
     return (torch.max(pg1, pg2) * valid).sum() / valid_count
+
+
+def _route_loss_effective_coef(args):
+    coef = float(getattr(args, "route_loss_coef", 0.0))
+    warmup = int(getattr(args, "route_loss_warmup_updates", 0))
+    if coef <= 0.0 or warmup <= 0:
+        return max(0.0, coef)
+    update_step = int(getattr(args, "_current_update_step", 0))
+    return coef * min(1.0, max(0.0, float(update_step + 1) / float(warmup)))
+
+
+def _solution_level_clipped_loss(
+    new_logprobs,
+    old_logprobs,
+    valid_step_mask,
+    objectives,
+    reference_obj,
+    is_offline,
+    reference_allowed,
+    args,
+):
+    """Auxiliary route-level PPO loss over complete successful trajectories."""
+    device = objectives.device
+    dtype = objectives.dtype
+    if new_logprobs.numel() == 0:
+        zero = torch.zeros((), device=device, dtype=dtype)
+        return zero, {
+            "route_loss": 0.0,
+            "route_ratio_mean": 1.0,
+            "route_ratio_std": 0.0,
+            "route_clip_frac": 0.0,
+            "route_adv_mean": 0.0,
+            "route_adv_std": 0.0,
+            "route_used": 0,
+        }
+
+    mask_f = valid_step_mask.to(dtype)
+    valid_counts = mask_f.sum(dim=0).clamp_min(1.0)
+    delta_logp = new_logprobs - old_logprobs
+    mean_delta = (delta_logp * mask_f).sum(dim=0) / valid_counts
+    r_route = torch.exp(mean_delta.clamp(-20.0, 20.0))
+
+    source = str(getattr(args, "route_adv_source", "group_ref")).lower()
+    use_group = source in ("group", "group_ref", "ref_group")
+    use_ref = source in ("ref", "group_ref", "ref_group")
+
+    group_adv = torch.zeros_like(objectives)
+    if use_group:
+        std_floor = max(float(getattr(args, "route_adv_std_floor", 0.0)), 0.0)
+        for env_idx in range(objectives.shape[0]):
+            obj = objectives[env_idx]
+            finite = torch.isfinite(obj)
+            if finite.sum() <= 1:
+                continue
+            vals = obj[finite]
+            std = vals.std(unbiased=False)
+            denom = torch.clamp(std, min=std_floor)
+            if torch.isfinite(denom) and float(denom.detach().cpu().item()) > 1e-12:
+                group_adv[env_idx, finite] = (vals.mean() - vals) / (denom + 1e-8)
+        group_adv = group_adv.clamp(-float(args.group_adv_clip), float(args.group_adv_clip))
+
+    ref_used = torch.zeros_like(objectives)
+    if use_ref and reference_obj is not None and is_offline is not None:
+        sub_rollout = {
+            "objectives": objectives,
+            "reference_obj": reference_obj,
+            "is_offline": is_offline,
+        }
+        if reference_allowed is not None:
+            sub_rollout["reference_allowed"] = reference_allowed
+        _ref_raw, ref_used, _ref_gate = _reference_conditioned_advantage(sub_rollout, args)
+
+    route_adv = (
+        float(args.group_adv_coef) * group_adv
+        + float(args.reference_adv_coef) * ref_used
+    ).detach()
+
+    route_mask = torch.isfinite(objectives) & (valid_counts > 0)
+    if bool(getattr(args, "only_success_route_loss", True)):
+        route_mask = route_mask & torch.isfinite(objectives)
+
+    mask_mode = str(getattr(args, "route_mask_mode", "all")).lower()
+    if mask_mode in ("positive", "positive_elite", "elite_positive"):
+        route_mask = route_mask & (route_adv > float(getattr(args, "route_positive_eps", 0.0)))
+    if mask_mode in ("elite", "positive_elite", "elite_positive"):
+        elite_mask = torch.zeros_like(route_mask)
+        elite_frac = min(max(float(getattr(args, "route_elite_frac", 0.25)), 0.0), 1.0)
+        for env_idx in range(objectives.shape[0]):
+            obj = objectives[env_idx]
+            finite = torch.isfinite(obj)
+            if finite.sum() == 0:
+                continue
+            idx = torch.nonzero(finite, as_tuple=False).flatten()
+            vals = obj[idx]
+            k = max(1, int(np.ceil(elite_frac * int(idx.numel()))))
+            elite_idx = idx[torch.argsort(vals)[:k]]
+            elite_mask[env_idx, elite_idx] = True
+        route_mask = route_mask & elite_mask
+
+    if route_mask.sum() == 0:
+        zero = torch.zeros((), device=device, dtype=dtype)
+        return zero, {
+            "route_loss": 0.0,
+            "route_ratio_mean": 1.0,
+            "route_ratio_std": 0.0,
+            "route_clip_frac": 0.0,
+            "route_adv_mean": 0.0,
+            "route_adv_std": 0.0,
+            "route_used": 0,
+        }
+
+    r = r_route[route_mask]
+    adv = route_adv[route_mask]
+    clipped_r = torch.clamp(
+        r,
+        1.0 - float(args.route_clip_eps),
+        1.0 + float(args.route_clip_eps),
+    )
+    route_loss = -torch.min(r * adv, clipped_r * adv).mean()
+    clip_frac = ((r > 1.0 + float(args.route_clip_eps)) | (r < 1.0 - float(args.route_clip_eps))).float().mean()
+    logs = {
+        "route_loss": float(route_loss.detach().cpu().item()),
+        "route_ratio_mean": float(r.detach().mean().cpu().item()),
+        "route_ratio_std": float(r.detach().std(unbiased=False).cpu().item()) if r.numel() > 1 else 0.0,
+        "route_clip_frac": float(clip_frac.detach().cpu().item()),
+        "route_adv_mean": float(adv.detach().mean().cpu().item()),
+        "route_adv_std": float(adv.detach().std(unbiased=False).cpu().item()) if adv.numel() > 1 else 0.0,
+        "route_used": int(route_mask.sum().detach().cpu().item()),
+    }
+    return route_loss, logs
 
 
 def _flat_grad_vector(loss, params):
@@ -1275,13 +1168,11 @@ def _grad_cosine_diagnostics(agent, ratio, valid, adv_parts, mb_inds, args):
     group_g = grad_for("group_contrib")
     ref_g = grad_for("ref_contrib")
     cmp_g = grad_for("cmp_contrib")
-    milestone_g = grad_for("milestone_contrib")
     return {
         "cos_obj_progress": _grad_cosine(obj_g, prog_g),
         "cos_base_group": _grad_cosine(base_g, group_g),
         "cos_base_ref": _grad_cosine(base_g, ref_g),
         "cos_base_cmp": _grad_cosine(base_g, cmp_g),
-        "cos_base_milestone": _grad_cosine(base_g, milestone_g),
     }
 
 
@@ -1321,6 +1212,14 @@ def _ppo_update(agent, optim_backbone, optim_critic, envs, rollout, advantages, 
     v_losses = []
     entropies = []
     kls = []
+    route_losses = []
+    route_ratio_means = []
+    route_ratio_stds = []
+    route_clip_fracs = []
+    route_adv_means = []
+    route_adv_stds = []
+    route_used_counts = []
+    route_effective_coefs = []
     grad_cos_info = {}
 
     accum_steps = max(1, int(args.accum_steps))
@@ -1399,7 +1298,41 @@ def _ppo_update(agent, optim_backbone, optim_critic, envs, rollout, advantages, 
                 v_loss = 0.5 * (value_loss_raw * value_valid).sum() / value_valid_count
 
             entropy_loss = (entropy * mb_valid).sum() / valid_count_f
-            loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+
+            route_loss = torch.zeros((), device=pg_loss.device, dtype=pg_loss.dtype)
+            route_coef_eff = 0.0
+            if bool(getattr(args, "use_route_level_loss", False)):
+                route_coef_eff = _route_loss_effective_coef(args)
+                route_objectives = rollout["objectives"][mbenvinds]
+                route_reference_obj = rollout.get("reference_obj", None)
+                if route_reference_obj is not None:
+                    route_reference_obj = route_reference_obj[mbenvinds]
+                route_is_offline = rollout.get("is_offline", None)
+                if route_is_offline is not None:
+                    route_is_offline = route_is_offline[mbenvinds]
+                route_reference_allowed = rollout.get("reference_allowed", None)
+                if route_reference_allowed is not None:
+                    route_reference_allowed = route_reference_allowed[mbenvinds]
+                route_loss, route_info = _solution_level_clipped_loss(
+                    new_logprobs=newlogprob.reshape(valid_step, envsperbatch, args.n_traj),
+                    old_logprobs=b_old_logprobs[mb_inds].reshape(valid_step, envsperbatch, args.n_traj),
+                    valid_step_mask=mb_valid.reshape(valid_step, envsperbatch, args.n_traj),
+                    objectives=route_objectives,
+                    reference_obj=route_reference_obj,
+                    is_offline=route_is_offline,
+                    reference_allowed=route_reference_allowed,
+                    args=args,
+                )
+                route_losses.append(route_info["route_loss"])
+                route_ratio_means.append(route_info["route_ratio_mean"])
+                route_ratio_stds.append(route_info["route_ratio_std"])
+                route_clip_fracs.append(route_info["route_clip_frac"])
+                route_adv_means.append(route_info["route_adv_mean"])
+                route_adv_stds.append(route_info["route_adv_std"])
+                route_used_counts.append(route_info["route_used"])
+                route_effective_coefs.append(route_coef_eff)
+
+            loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss + route_coef_eff * route_loss
             (loss / accum_steps).backward()
             accum_counter += 1
 
@@ -1429,6 +1362,14 @@ def _ppo_update(agent, optim_backbone, optim_critic, envs, rollout, advantages, 
         "v_loss": float(np.mean(v_losses)) if v_losses else 0.0,
         "entropy": float(np.mean(entropies)) if entropies else 0.0,
         "kl": float(np.mean(kls)) if kls else 0.0,
+        "route_loss": float(np.mean(route_losses)) if route_losses else 0.0,
+        "route_coef": float(np.mean(route_effective_coefs)) if route_effective_coefs else 0.0,
+        "route_ratio_mean": float(np.mean(route_ratio_means)) if route_ratio_means else 1.0,
+        "route_ratio_std": float(np.mean(route_ratio_stds)) if route_ratio_stds else 0.0,
+        "route_clip_frac": float(np.mean(route_clip_fracs)) if route_clip_fracs else 0.0,
+        "route_adv_mean": float(np.mean(route_adv_means)) if route_adv_means else 0.0,
+        "route_adv_std": float(np.mean(route_adv_stds)) if route_adv_stds else 0.0,
+        "route_used": float(np.mean(route_used_counts)) if route_used_counts else 0.0,
         "grad_backbone": grad_norm(agent.backbone.parameters()),
         "grad_critic": grad_norm(agent.critic.parameters()),
         "grad_cos": grad_cos_info,
@@ -1500,11 +1441,7 @@ def _update_incumbents_from_rollout(records_meta, envs, rollout, args, online_bu
                 record["student_regret"] = student_obj - incumbent_obj if np.isfinite(student_obj) else incumbent_obj
                 record["student_regret_known"] = True
             record["student_action_sequence"] = list(full_seq)
-            if (
-                bool(getattr(args, "allow_incumbent_updates", True))
-                and np.isfinite(student_obj)
-                and student_obj + float(args.incumbent_update_eps) < incumbent_obj
-            ):
+            if np.isfinite(student_obj) and student_obj + float(args.incumbent_update_eps) < incumbent_obj:
                 record["incumbent_obj"] = student_obj
                 record["incumbent_action_sequence"] = list(full_seq)
                 record["incumbent_source"] = "policy"
@@ -1833,14 +1770,11 @@ def _print_update_summary(update_step, args, rollout, ppo_info, aux_info, archiv
         f"ref_raw={adv_debug.get('ref_raw_std', 0.0):.3f} "
         f"ref_used={adv_debug.get('ref_used_std', 0.0):.3f} "
         f"ref_gate={adv_debug.get('ref_gate_mean', 0.0):.3f}/{adv_debug.get('ref_gate_active', 0.0):.3f} "
+        f"var_gate={adv_debug.get('var_gate_mean', 1.0):.3f}/{adv_debug.get('var_gate_active', 1.0):.3f} "
         f"ref={adv_debug.get('ref_contrib_std', 0.0):.3f} "
         f"cmp_raw={adv_debug.get('cmp_raw_std', 0.0):.3f} "
         f"cmp_used={adv_debug.get('cmp_used_std', 0.0):.3f} "
         f"cmp={adv_debug.get('cmp_contrib_std', 0.0):.3f} "
-        f"mile_raw={adv_debug.get('milestone_raw_std', 0.0):.3f} "
-        f"mile_used={adv_debug.get('milestone_used_std', 0.0):.3f} "
-        f"mile_active={adv_debug.get('milestone_active', 0.0):.3f} "
-        f"mile={adv_debug.get('milestone_contrib_std', 0.0):.3f} "
         f"final={adv_debug.get('final_std', 0.0):.3f}"
     )
     grad_cos = ppo_info.get("grad_cos", {}) or {}
@@ -1848,8 +1782,15 @@ def _print_update_summary(update_step, args, rollout, ppo_info, aux_info, archiv
         f"obj_prog={grad_cos.get('cos_obj_progress', float('nan')):.3f} "
         f"base_group={grad_cos.get('cos_base_group', grad_cos.get('cos_base_rank', float('nan'))):.3f} "
         f"base_ref={grad_cos.get('cos_base_ref', float('nan')):.3f} "
-        f"base_cmp={grad_cos.get('cos_base_cmp', float('nan')):.3f} "
-        f"base_mile={grad_cos.get('cos_base_milestone', float('nan')):.3f}"
+        f"base_cmp={grad_cos.get('cos_base_cmp', float('nan')):.3f}"
+    )
+    sl_text = "none" if float(ppo_info.get("route_coef", 0.0)) <= 0.0 else (
+        f"loss={ppo_info.get('route_loss', 0.0):.5f} "
+        f"coef={ppo_info.get('route_coef', 0.0):.3f} "
+        f"ratio={ppo_info.get('route_ratio_mean', 1.0):.3f}/{ppo_info.get('route_ratio_std', 0.0):.3f} "
+        f"clip={ppo_info.get('route_clip_frac', 0.0):.3f} "
+        f"adv={ppo_info.get('route_adv_mean', 0.0):.3f}/{ppo_info.get('route_adv_std', 0.0):.3f} "
+        f"used={ppo_info.get('route_used', 0.0):.1f}"
     )
     print(
         f"[Train] update={update_step} "
@@ -1861,6 +1802,7 @@ def _print_update_summary(update_step, args, rollout, ppo_info, aux_info, archiv
         f"pg={ppo_info['pg_loss']:.5f} "
         f"vf={ppo_info['v_loss']:.5f} "
         f"kl={ppo_info['kl']:.5f} "
+        f"sl=({sl_text}) "
         f"aux=({aux_text}) "
         f"archive_added={archive_info.get('added_online', 0)} "
         f"regret=({regret_text}) "
@@ -2232,24 +2174,28 @@ def parse_args():
 
     parser.add_argument("--group-adv-coef", type=float, default=0.0)
     parser.add_argument("--group-adv-clip", type=float, default=3.0)
+    parser.add_argument("--use-variance-group-gate", type=str2bool, default=False, nargs="?", const=True)
+    parser.add_argument("--variance-gate-vmin", type=float, default=0.005)
+    parser.add_argument("--variance-gate-vmax", type=float, default=0.030)
     parser.add_argument("--rank-adv-coef", type=float, default=0.0)
     parser.add_argument("--rank-adv-clip", type=float, default=3.0)
     parser.add_argument("--reference-adv-coef", type=float, default=0.0)
     parser.add_argument("--reference-adv-rho", type=float, default=0.05)
     parser.add_argument("--reference-adv-clip", type=float, default=2.0)
     parser.add_argument("--reference-adv-alns-win-only", type=str2bool, default=False, nargs="?", const=True)
-    parser.add_argument("--reference-adv-allow-states", type=str, default="")
-    parser.add_argument("--reference-adv-source", type=str, default="incumbent", choices=["teacher", "incumbent", "best_archive", "policy"])
-    parser.add_argument("--allow-incumbent-updates", type=str2bool, default=True, nargs="?", const=True)
     parser.add_argument("--reference-adv-gate-mode", type=str, default="fixed", choices=["fixed", "linear", "hard"])
     parser.add_argument("--reference-adv-gate-temp", type=float, default=0.05)
     parser.add_argument("--reference-adv-hard-threshold", type=float, default=0.03)
-    parser.add_argument("--use-milestone-reference", type=str2bool, default=False, nargs="?", const=True)
-    parser.add_argument("--milestone-ref-coef", type=float, default=0.0)
-    parser.add_argument("--milestone-ref-rho", type=float, default=0.10)
-    parser.add_argument("--milestone-ref-clip", type=float, default=2.0)
-    parser.add_argument("--milestone-ref-denom", type=str, default="milestone", choices=["milestone", "reference_obj"])
-    parser.add_argument("--milestone-ref-use-ref-gate", type=str2bool, default=True, nargs="?", const=True)
+    parser.add_argument("--use-route-level-loss", type=str2bool, default=False, nargs="?", const=True)
+    parser.add_argument("--route-loss-coef", type=float, default=0.0)
+    parser.add_argument("--route-loss-warmup-updates", type=int, default=0)
+    parser.add_argument("--route-clip-eps", type=float, default=0.2)
+    parser.add_argument("--route-adv-source", type=str, default="group_ref", choices=["group", "ref", "group_ref", "ref_group"])
+    parser.add_argument("--route-adv-std-floor", type=float, default=0.0)
+    parser.add_argument("--only-success-route-loss", type=str2bool, default=True, nargs="?", const=True)
+    parser.add_argument("--route-mask-mode", type=str, default="all", choices=["all", "positive", "elite", "positive_elite", "elite_positive"])
+    parser.add_argument("--route-elite-frac", type=float, default=0.25)
+    parser.add_argument("--route-positive-eps", type=float, default=0.0)
     parser.add_argument("--cmp-adv-coef", type=float, default=0.0)
     parser.add_argument("--cmp-adv-clip", type=float, default=3.0)
     parser.add_argument("--cmp-adv-mode", type=str, default="raw", choices=["raw", "gap_temp"])
@@ -2310,10 +2256,14 @@ def parse_args():
         raise ValueError("group_adv_clip, reference_adv_rho and reference_adv_clip must be positive.")
     if args.reference_adv_gate_temp <= 0 or args.reference_adv_hard_threshold < 0:
         raise ValueError("reference_adv_gate_temp must be positive and reference_adv_hard_threshold must be non-negative.")
-    if args.milestone_ref_rho <= 0 or args.milestone_ref_clip <= 0:
-        raise ValueError("milestone_ref_rho and milestone_ref_clip must be positive.")
-    if args.milestone_ref_coef < 0:
-        raise ValueError("milestone_ref_coef must be non-negative.")
+    if args.route_loss_coef < 0 or args.route_loss_warmup_updates < 0:
+        raise ValueError("route_loss_coef and route_loss_warmup_updates must be non-negative.")
+    if args.route_clip_eps <= 0 or args.route_adv_std_floor < 0:
+        raise ValueError("route_clip_eps must be positive and route_adv_std_floor must be non-negative.")
+    if args.variance_gate_vmin < 0 or args.variance_gate_vmax <= args.variance_gate_vmin:
+        raise ValueError("variance_gate_vmax must be greater than variance_gate_vmin >= 0.")
+    if not (0.0 < args.route_elite_frac <= 1.0) or args.route_positive_eps < 0:
+        raise ValueError("route_elite_frac must be in (0, 1] and route_positive_eps must be non-negative.")
     if args.grad_cos_freq <= 0:
         raise ValueError("grad_cos_freq must be positive.")
     for name in (

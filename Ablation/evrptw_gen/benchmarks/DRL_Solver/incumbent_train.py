@@ -536,6 +536,7 @@ def _student_rollout(
         device=device,
     )
     logprobs = torch.zeros((num_steps, num_envs, args.n_traj), device=device)
+    entropies = torch.zeros((num_steps, num_envs, args.n_traj), device=device)
     rewards = torch.zeros((num_steps, num_envs, args.n_traj), device=device)
     reward_components = {
         name: torch.zeros((num_steps, num_envs, args.n_traj), device=device)
@@ -569,7 +570,7 @@ def _student_rollout(
         valid_masks[step] = alive
 
         with torch.no_grad():
-            action, logprob, _, value = _rollout_action_value_cached(
+            action, logprob, entropy, value = _rollout_action_value_cached(
                 agent,
                 next_obs,
                 encoder_state,
@@ -584,6 +585,7 @@ def _student_rollout(
 
         actions[step] = action
         logprobs[step] = logprob.view(num_envs, args.n_traj)
+        entropies[step] = entropy.view(num_envs, args.n_traj)
 
         if step == num_steps - 1:
             for env in envs.envs:
@@ -615,6 +617,7 @@ def _student_rollout(
         "obs": obs_buf[:valid_step],
         "actions": actions[:valid_step],
         "logprobs": logprobs[:valid_step],
+        "entropies": entropies[:valid_step],
         "rewards": rewards[:valid_step],
         "objectives": objectives,
         "dones": dones[:valid_step],
@@ -686,33 +689,89 @@ def _trajectory_rank_advantage(objectives, clip_value, mode="zscore", std_floor=
 
 def _decision_fork_gate(rollout, args, valid_masks):
     if not bool(getattr(args, "use_decision_fork_gate", False)):
+        rollout["fork_gate_debug"] = {}
         return torch.ones_like(valid_masks, dtype=torch.float32)
     obs_seq = rollout.get("obs", [])
     if not obs_seq or "action_mask" not in obs_seq[0]:
+        rollout["fork_gate_debug"] = {}
         return torch.ones_like(valid_masks, dtype=torch.float32)
-    gates = []
+
+    mode = str(getattr(args, "decision_fork_gate_mode", "soft")).lower()
     min_actions = float(getattr(args, "decision_fork_min_actions", 4))
     max_actions = float(getattr(args, "decision_fork_max_actions", 12))
     span = max(max_actions - min_actions, 1e-8)
-    mode = str(getattr(args, "decision_fork_gate_mode", "soft")).lower()
     device = valid_masks.device
-    for obs in obs_seq[: valid_masks.shape[0]]:
-        mask = torch.as_tensor(obs["action_mask"], device=device, dtype=torch.bool)
-        # action_mask: [env, n_traj, action_dim], True means feasible.
-        counts = mask.sum(dim=-1).to(torch.float32)
-        if mode == "hard":
-            gate = (counts >= min_actions).to(torch.float32)
-        else:
-            gate = ((counts - min_actions) / span).clamp(0.0, 1.0)
-        gates.append(gate)
-    if not gates:
-        return torch.ones_like(valid_masks, dtype=torch.float32)
-    gate_tensor = torch.stack(gates, dim=0)
-    if gate_tensor.shape[0] < valid_masks.shape[0]:
-        pad = torch.ones_like(valid_masks[gate_tensor.shape[0]:], dtype=torch.float32)
-        gate_tensor = torch.cat([gate_tensor, pad], dim=0)
-    return gate_tensor.to(valid_masks.device, dtype=torch.float32) * valid_masks.to(torch.float32)
 
+    masks = []
+    for obs in obs_seq[: valid_masks.shape[0]]:
+        masks.append(torch.as_tensor(obs["action_mask"], device=device, dtype=torch.bool))
+    if not masks:
+        rollout["fork_gate_debug"] = {}
+        return torch.ones_like(valid_masks, dtype=torch.float32)
+
+    mask_tensor = torch.stack(masks, dim=0)
+    if mask_tensor.shape[0] < valid_masks.shape[0]:
+        pad_shape = (valid_masks.shape[0] - mask_tensor.shape[0],) + tuple(mask_tensor.shape[1:])
+        pad = torch.ones(pad_shape, device=device, dtype=torch.bool)
+        mask_tensor = torch.cat([mask_tensor, pad], dim=0)
+    mask_tensor = mask_tensor[: valid_masks.shape[0]]
+    # action_mask: [step, env, n_traj, action_dim], True means feasible.
+    counts = mask_tensor.sum(dim=-1).to(torch.float32)
+
+    debug = {
+        "fork_feasible_count_mean": _masked_mean(counts, valid_masks),
+    }
+    if mode in ("none", "off", "false"):
+        gate_tensor = torch.ones_like(valid_masks, dtype=torch.float32)
+    elif mode in ("hard", "feasible_count", "feasible"):
+        gate_tensor = (counts >= min_actions).to(torch.float32)
+    elif mode == "entropy":
+        entropy = rollout.get("entropies", None)
+        if entropy is None:
+            gate_tensor = (counts >= min_actions).to(torch.float32)
+        else:
+            entropy = entropy.to(device=device, dtype=torch.float32)
+            max_entropy = torch.log(counts.clamp_min(2.0))
+            norm_entropy = (entropy / (max_entropy + 1e-8)).clamp_min(0.0)
+            threshold = float(getattr(args, "decision_fork_entropy_threshold", 0.60))
+            gate_tensor = (norm_entropy >= threshold).to(torch.float32)
+            debug["fork_entropy_mean"] = _masked_mean(entropy, valid_masks)
+            debug["fork_norm_entropy_mean"] = _masked_mean(norm_entropy, valid_masks)
+    elif mode == "route_structure":
+        actions = rollout.get("actions", None)
+        if actions is None:
+            gate_tensor = torch.ones_like(valid_masks, dtype=torch.float32)
+        else:
+            actions_long = actions.to(device=device, dtype=torch.long)
+            current = torch.zeros_like(actions_long)
+            if actions_long.shape[0] > 1:
+                current[1:] = actions_long[:-1]
+            num_customers = int(getattr(args, "train_cus_num", 50))
+            depot_id = 0
+            is_depot_action = actions_long == depot_id
+            is_customer_action = (actions_long >= 1) & (actions_long <= num_customers)
+            is_rs_action = actions_long > num_customers
+            is_current_depot = current == depot_id
+            feasible_customer_exists = mask_tensor[..., 1 : num_customers + 1].any(dim=-1)
+            depot_feasible = mask_tensor[..., depot_id]
+
+            depot_boundary = is_depot_action & feasible_customer_exists
+            rs_decision = is_rs_action & feasible_customer_exists
+            route_start = is_current_depot & is_customer_action
+            continue_vs_return = is_customer_action & depot_feasible
+            gate_bool = depot_boundary | rs_decision | route_start | continue_vs_return
+            gate_tensor = gate_bool.to(torch.float32)
+            debug["fork_route_depot_boundary"] = _masked_mean(depot_boundary.to(torch.float32), valid_masks)
+            debug["fork_route_rs_decision"] = _masked_mean(rs_decision.to(torch.float32), valid_masks)
+            debug["fork_route_start"] = _masked_mean(route_start.to(torch.float32), valid_masks)
+            debug["fork_route_continue_vs_return"] = _masked_mean(continue_vs_return.to(torch.float32), valid_masks)
+    else:
+        # Backward-compatible soft feasible-count gate.
+        gate_tensor = ((counts - min_actions) / span).clamp(0.0, 1.0)
+
+    gate_tensor = gate_tensor.to(valid_masks.device, dtype=torch.float32) * valid_masks.to(torch.float32)
+    rollout["fork_gate_debug"] = debug
+    return gate_tensor
 
 def _variance_group_gate(objectives, args):
     if not bool(getattr(args, "use_variance_group_gate", False)):
@@ -1048,6 +1107,7 @@ def _compute_gae_and_returns(agent, rollout, args, device):
             "cmp_contrib_std": _masked_std(adv_parts["cmp_contrib"], mask),
             "final_std": _masked_std(final_adv, mask),
         }
+        debug.update(rollout.get("fork_gate_debug", {}))
         if "obj_norm" in adv_parts:
             debug["obj_norm_std"] = _masked_std(adv_parts["obj_norm"], mask)
         if "progress_norm" in adv_parts:
@@ -2246,9 +2306,16 @@ def parse_args():
     parser.add_argument("--variance-gate-vmin", type=float, default=0.005)
     parser.add_argument("--variance-gate-vmax", type=float, default=0.030)
     parser.add_argument("--use-decision-fork-gate", type=str2bool, default=False, nargs="?", const=True)
-    parser.add_argument("--decision-fork-gate-mode", type=str, default="soft", choices=["soft", "hard"])
+    parser.add_argument(
+        "--decision-fork-gate-mode",
+        type=str,
+        default="soft",
+        choices=["none", "soft", "hard", "entropy", "feasible_count", "feasible", "route_structure"],
+    )
     parser.add_argument("--decision-fork-min-actions", type=int, default=4)
+    parser.add_argument("--decision-fork-min-feasible-actions", dest="decision_fork_min_actions", type=int)
     parser.add_argument("--decision-fork-max-actions", type=int, default=12)
+    parser.add_argument("--decision-fork-entropy-threshold", type=float, default=0.60)
     parser.add_argument("--rank-adv-coef", type=float, default=0.0)
     parser.add_argument("--rank-adv-clip", type=float, default=3.0)
     parser.add_argument("--reference-adv-coef", type=float, default=0.0)
@@ -2338,6 +2405,8 @@ def parse_args():
         raise ValueError("variance_gate_vmax must be greater than variance_gate_vmin >= 0.")
     if args.decision_fork_min_actions < 1 or args.decision_fork_max_actions <= args.decision_fork_min_actions:
         raise ValueError("decision_fork_max_actions must be greater than decision_fork_min_actions >= 1.")
+    if not (0.0 <= args.decision_fork_entropy_threshold <= 1.0):
+        raise ValueError("decision_fork_entropy_threshold must be in [0, 1].")
     if not (0.0 < args.route_elite_frac <= 1.0) or args.route_positive_eps < 0:
         raise ValueError("route_elite_frac must be in (0, 1] and route_positive_eps must be non-negative.")
     if args.grad_cos_freq <= 0:

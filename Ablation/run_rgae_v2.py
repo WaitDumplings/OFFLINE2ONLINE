@@ -90,10 +90,22 @@ BASE_REF = [
     "--reference-adv-hard-threshold", "0.03",
 ]
 
-VAR_GATE = [
+TIGHT_VAR_GATE = [
     "--use-variance-group-gate", "true",
-    "--variance-gate-vmin", "0.005",
-    "--variance-gate-vmax", "0.030",
+    "--variance-gate-vmin", "0.015",
+    "--variance-gate-vmax", "0.050",
+]
+
+TOP_BOTTOM_GROUP = [
+    "--group-adv-mode", "top_bottom",
+    "--group-adv-top-frac", "0.25",
+]
+
+DECISION_FORK_GATE = [
+    "--use-decision-fork-gate", "true",
+    "--decision-fork-gate-mode", "soft",
+    "--decision-fork-min-actions", "4",
+    "--decision-fork-max-actions", "12",
 ]
 
 NO_ROUTE = [
@@ -127,28 +139,28 @@ def build_jobs(seed: int, num_updates: int, save_dir: Path) -> list[dict]:
             "extra": [*INCUMBENT, *BASE_REF, *NO_ROUTE, "--save-dir", str(save_dir / f"gpu0_exp3_softgate_seed{seed}_u{num_updates}")],
         },
         {
-            "label": "Exp3 + variance-aware group gate",
-            "name": f"gpu1_exp3_var_gate_seed{seed}_u{num_updates}",
+            "label": "Exp3 + tight variance group gate",
+            "name": f"gpu1_exp3_tight_var_gate_seed{seed}_u{num_updates}",
             "gpu": "1",
-            "note": "effective group filtering: downweight low-spread trajectory groups",
+            "note": "effective group filtering: tighter variance gate, vmin=0.015/vmax=0.050",
             "common": common,
-            "extra": [*INCUMBENT, *BASE_REF, *VAR_GATE, *NO_ROUTE, "--save-dir", str(save_dir / f"gpu1_exp3_var_gate_seed{seed}_u{num_updates}")],
+            "extra": [*INCUMBENT, *BASE_REF, *TIGHT_VAR_GATE, *NO_ROUTE, "--save-dir", str(save_dir / f"gpu1_exp3_tight_var_gate_seed{seed}_u{num_updates}")],
         },
         {
-            "label": "Exp3 + positive elite route auxiliary",
-            "name": f"gpu2_exp3_elite_route_seed{seed}_u{num_updates}",
+            "label": "Exp3 + top-bottom group advantage",
+            "name": f"gpu2_exp3_top_bottom_group_seed{seed}_u{num_updates}",
             "gpu": "2",
-            "note": "elite-only solution-level auxiliary: positive top-25% successful routes",
+            "note": "bias-controlled group signal: top 25% routes get +1, bottom 25% get -1",
             "common": common,
-            "extra": [*INCUMBENT, *BASE_REF, *ELITE_ROUTE, "--save-dir", str(save_dir / f"gpu2_exp3_elite_route_seed{seed}_u{num_updates}")],
+            "extra": [*INCUMBENT, *BASE_REF, *TOP_BOTTOM_GROUP, *NO_ROUTE, "--save-dir", str(save_dir / f"gpu2_exp3_top_bottom_group_seed{seed}_u{num_updates}")],
         },
         {
-            "label": "Exp3 + variance gate + positive elite route auxiliary",
-            "name": f"gpu3_exp3_var_gate_elite_route_seed{seed}_u{num_updates}",
+            "label": "Exp3 + decision-fork gate",
+            "name": f"gpu3_exp3_decision_fork_seed{seed}_u{num_updates}",
             "gpu": "3",
-            "note": "combined effective group filtering and elite route reinforcement",
+            "note": "apply group/ref route-level credit mainly at high-branching feasible decision points",
             "common": common,
-            "extra": [*INCUMBENT, *BASE_REF, *VAR_GATE, *ELITE_ROUTE, "--save-dir", str(save_dir / f"gpu3_exp3_var_gate_elite_route_seed{seed}_u{num_updates}")],
+            "extra": [*INCUMBENT, *BASE_REF, *DECISION_FORK_GATE, *NO_ROUTE, "--save-dir", str(save_dir / f"gpu3_exp3_decision_fork_seed{seed}_u{num_updates}")],
         },
     ]
 
@@ -198,8 +210,9 @@ def main() -> int:
             "reference_adv_coef": 0.10,
             "reference_adv_rho": 0.10,
             "reference_adv_gate_mode": "linear",
-            "variance_gate": {"vmin": 0.005, "vmax": 0.030},
-            "elite_route": {"coef": 0.10, "warmup_updates": 50, "mask": "positive_elite", "elite_frac": 0.25},
+            "tight_variance_gate": {"vmin": 0.015, "vmax": 0.050},
+            "top_bottom_group": {"top_frac": 0.25},
+            "decision_fork_gate": {"mode": "soft", "min_actions": 4, "max_actions": 12},
             "n_traj": 50,
             "test_agent": 8,
         },

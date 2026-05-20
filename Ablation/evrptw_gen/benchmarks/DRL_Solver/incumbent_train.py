@@ -646,18 +646,72 @@ def _instance_normalize_advantages(advantages, valid_masks):
     return out * valid_masks
 
 
-def _trajectory_rank_advantage(objectives, clip_value):
+def _trajectory_rank_advantage(objectives, clip_value, mode="zscore", std_floor=0.0, top_frac=0.25):
     rank = torch.zeros_like(objectives)
+    mode = str(mode).lower()
+    top_frac = min(max(float(top_frac), 0.0), 1.0)
+    std_floor = max(float(std_floor), 0.0)
     for env_idx in range(objectives.shape[0]):
         obj = objectives[env_idx]
         valid = torch.isfinite(obj)
         if valid.sum() <= 1:
             continue
         vals = obj[valid]
-        std = vals.std()
-        if torch.isfinite(std) and std > 1e-8:
-            rank[env_idx, valid] = (vals.mean() - vals) / (std + 1e-8)
+        if mode == "rank":
+            order = torch.argsort(vals)
+            scores = torch.zeros_like(vals)
+            n = int(vals.numel())
+            if n == 1:
+                scores[order[0]] = 0.0
+            else:
+                # lower objective is better: best=+1, worst=-1
+                positions = torch.arange(n, device=vals.device, dtype=vals.dtype)
+                scores[order] = 1.0 - 2.0 * positions / float(n - 1)
+            rank[env_idx, valid] = scores
+        elif mode == "top_bottom":
+            n = int(vals.numel())
+            k = max(1, int(np.ceil(top_frac * n)))
+            order = torch.argsort(vals)
+            scores = torch.zeros_like(vals)
+            scores[order[:k]] = 1.0
+            scores[order[-k:]] = -1.0
+            rank[env_idx, valid] = scores
+        else:
+            std = vals.std(unbiased=False)
+            denom = torch.clamp(std, min=std_floor)
+            if torch.isfinite(denom) and denom > 1e-8:
+                rank[env_idx, valid] = (vals.mean() - vals) / (denom + 1e-8)
     return rank.clamp(-clip_value, clip_value)
+
+
+def _decision_fork_gate(rollout, args, valid_masks):
+    if not bool(getattr(args, "use_decision_fork_gate", False)):
+        return torch.ones_like(valid_masks, dtype=torch.float32)
+    obs_seq = rollout.get("obs", [])
+    if not obs_seq or "action_mask" not in obs_seq[0]:
+        return torch.ones_like(valid_masks, dtype=torch.float32)
+    gates = []
+    min_actions = float(getattr(args, "decision_fork_min_actions", 4))
+    max_actions = float(getattr(args, "decision_fork_max_actions", 12))
+    span = max(max_actions - min_actions, 1e-8)
+    mode = str(getattr(args, "decision_fork_gate_mode", "soft")).lower()
+    device = valid_masks.device
+    for obs in obs_seq[: valid_masks.shape[0]]:
+        mask = torch.as_tensor(obs["action_mask"], device=device, dtype=torch.bool)
+        # action_mask: [env, n_traj, action_dim], True means feasible.
+        counts = mask.sum(dim=-1).to(torch.float32)
+        if mode == "hard":
+            gate = (counts >= min_actions).to(torch.float32)
+        else:
+            gate = ((counts - min_actions) / span).clamp(0.0, 1.0)
+        gates.append(gate)
+    if not gates:
+        return torch.ones_like(valid_masks, dtype=torch.float32)
+    gate_tensor = torch.stack(gates, dim=0)
+    if gate_tensor.shape[0] < valid_masks.shape[0]:
+        pad = torch.ones_like(valid_masks[gate_tensor.shape[0]:], dtype=torch.float32)
+        gate_tensor = torch.cat([gate_tensor, pad], dim=0)
+    return gate_tensor.to(valid_masks.device, dtype=torch.float32) * valid_masks.to(torch.float32)
 
 
 def _variance_group_gate(objectives, args):
@@ -925,18 +979,25 @@ def _compute_gae_and_returns(agent, rollout, args, device):
     ref_used = torch.zeros_like(rollout["objectives"])
     ref_gate = torch.zeros_like(rollout["objectives"])
     var_gate = _variance_group_gate(rollout["objectives"], args)
+    fork_gate = _decision_fork_gate(rollout, args, valid_masks)
 
     group_coef = _effective_group_adv_coef(args)
     if group_coef > 0:
-        group_adv = _trajectory_rank_advantage(rollout["objectives"], float(args.group_adv_clip))
+        group_adv = _trajectory_rank_advantage(
+            rollout["objectives"],
+            float(args.group_adv_clip),
+            mode=getattr(args, "group_adv_mode", "zscore"),
+            std_floor=getattr(args, "group_adv_std_floor", 0.0),
+            top_frac=getattr(args, "group_adv_top_frac", 0.25),
+        )
         group_adv = group_adv * var_gate
-        group_contrib = group_coef * group_adv.unsqueeze(0)
+        group_contrib = group_coef * group_adv.unsqueeze(0) * fork_gate
         actor_advantages = actor_advantages + group_contrib
 
     if float(getattr(args, "reference_adv_coef", 0.0)) > 0:
         ref_raw, ref_used, ref_gate = _reference_conditioned_advantage(rollout, args)
         ref_used = ref_used * var_gate
-        ref_contrib = float(args.reference_adv_coef) * ref_used.unsqueeze(0)
+        ref_contrib = float(args.reference_adv_coef) * ref_used.unsqueeze(0) * fork_gate
         actor_advantages = actor_advantages + ref_contrib
 
     if args.cmp_adv_coef > 0:
@@ -954,6 +1015,7 @@ def _compute_gae_and_returns(agent, rollout, args, device):
     adv_parts["ref_used"] = ref_used.unsqueeze(0).expand_as(actor_advantages) * valid_masks
     adv_parts["ref_gate"] = ref_gate.unsqueeze(0).expand_as(actor_advantages) * valid_masks
     adv_parts["var_gate"] = var_gate.unsqueeze(0).expand_as(actor_advantages) * valid_masks
+    adv_parts["fork_gate"] = fork_gate * valid_masks
     adv_parts["ref_contrib"] = ref_contrib * valid_masks
     adv_parts["cmp_raw"] = cmp_raw.unsqueeze(0).expand_as(actor_advantages) * valid_masks
     adv_parts["cmp_used"] = cmp_used.unsqueeze(0).expand_as(actor_advantages) * valid_masks
@@ -978,6 +1040,8 @@ def _compute_gae_and_returns(agent, rollout, args, device):
             "ref_gate_active": _masked_mean((adv_parts["ref_gate"] > 1e-8).to(torch.float32), mask),
             "var_gate_mean": _masked_mean(adv_parts["var_gate"], mask),
             "var_gate_active": _masked_mean((adv_parts["var_gate"] > 1e-8).to(torch.float32), mask),
+            "fork_gate_mean": _masked_mean(adv_parts["fork_gate"], mask),
+            "fork_gate_active": _masked_mean((adv_parts["fork_gate"] > 1e-8).to(torch.float32), mask),
             "ref_contrib_std": _masked_std(adv_parts["ref_contrib"], mask),
             "cmp_raw_std": _masked_std(adv_parts["cmp_raw"], mask),
             "cmp_used_std": _masked_std(adv_parts["cmp_used"], mask),
@@ -1771,6 +1835,7 @@ def _print_update_summary(update_step, args, rollout, ppo_info, aux_info, archiv
         f"ref_used={adv_debug.get('ref_used_std', 0.0):.3f} "
         f"ref_gate={adv_debug.get('ref_gate_mean', 0.0):.3f}/{adv_debug.get('ref_gate_active', 0.0):.3f} "
         f"var_gate={adv_debug.get('var_gate_mean', 1.0):.3f}/{adv_debug.get('var_gate_active', 1.0):.3f} "
+        f"fork_gate={adv_debug.get('fork_gate_mean', 1.0):.3f}/{adv_debug.get('fork_gate_active', 1.0):.3f} "
         f"ref={adv_debug.get('ref_contrib_std', 0.0):.3f} "
         f"cmp_raw={adv_debug.get('cmp_raw_std', 0.0):.3f} "
         f"cmp_used={adv_debug.get('cmp_used_std', 0.0):.3f} "
@@ -2174,9 +2239,16 @@ def parse_args():
 
     parser.add_argument("--group-adv-coef", type=float, default=0.0)
     parser.add_argument("--group-adv-clip", type=float, default=3.0)
+    parser.add_argument("--group-adv-mode", type=str, default="zscore", choices=["zscore", "std_floor", "rank", "top_bottom"])
+    parser.add_argument("--group-adv-std-floor", type=float, default=0.0)
+    parser.add_argument("--group-adv-top-frac", type=float, default=0.25)
     parser.add_argument("--use-variance-group-gate", type=str2bool, default=False, nargs="?", const=True)
     parser.add_argument("--variance-gate-vmin", type=float, default=0.005)
     parser.add_argument("--variance-gate-vmax", type=float, default=0.030)
+    parser.add_argument("--use-decision-fork-gate", type=str2bool, default=False, nargs="?", const=True)
+    parser.add_argument("--decision-fork-gate-mode", type=str, default="soft", choices=["soft", "hard"])
+    parser.add_argument("--decision-fork-min-actions", type=int, default=4)
+    parser.add_argument("--decision-fork-max-actions", type=int, default=12)
     parser.add_argument("--rank-adv-coef", type=float, default=0.0)
     parser.add_argument("--rank-adv-clip", type=float, default=3.0)
     parser.add_argument("--reference-adv-coef", type=float, default=0.0)
@@ -2254,6 +2326,8 @@ def parse_args():
         raise ValueError("cmp_gap_temp, cmp_adv_clip and cmp_raw_clip must be positive.")
     if args.group_adv_clip <= 0 or args.reference_adv_rho <= 0 or args.reference_adv_clip <= 0:
         raise ValueError("group_adv_clip, reference_adv_rho and reference_adv_clip must be positive.")
+    if args.group_adv_std_floor < 0 or not (0.0 < args.group_adv_top_frac <= 0.5):
+        raise ValueError("group_adv_std_floor must be non-negative and group_adv_top_frac must be in (0, 0.5].")
     if args.reference_adv_gate_temp <= 0 or args.reference_adv_hard_threshold < 0:
         raise ValueError("reference_adv_gate_temp must be positive and reference_adv_hard_threshold must be non-negative.")
     if args.route_loss_coef < 0 or args.route_loss_warmup_updates < 0:
@@ -2262,6 +2336,8 @@ def parse_args():
         raise ValueError("route_clip_eps must be positive and route_adv_std_floor must be non-negative.")
     if args.variance_gate_vmin < 0 or args.variance_gate_vmax <= args.variance_gate_vmin:
         raise ValueError("variance_gate_vmax must be greater than variance_gate_vmin >= 0.")
+    if args.decision_fork_min_actions < 1 or args.decision_fork_max_actions <= args.decision_fork_min_actions:
+        raise ValueError("decision_fork_max_actions must be greater than decision_fork_min_actions >= 1.")
     if not (0.0 < args.route_elite_frac <= 1.0) or args.route_positive_eps < 0:
         raise ValueError("route_elite_frac must be in (0, 1] and route_positive_eps must be non-negative.")
     if args.grad_cos_freq <= 0:

@@ -9,9 +9,9 @@ from plot_slppo import ROOT, parse_log, _plot_curves
 
 SERIES = [
     ("Exp3 soft gate baseline", "gpu0_exp3_softgate"),
-    ("Exp3 + variance gate", "gpu1_exp3_var_gate"),
-    ("Exp3 + elite route aux", "gpu2_exp3_elite_route"),
-    ("Exp3 + variance + elite", "gpu3_exp3_var_gate_elite_route"),
+    ("Exp3 + tight variance gate", "gpu1_exp3_tight_var_gate"),
+    ("Exp3 + top-bottom group", "gpu2_exp3_top_bottom_group"),
+    ("Exp3 + decision-fork gate", "gpu3_exp3_decision_fork"),
 ]
 
 
@@ -26,7 +26,7 @@ def infer_series(log_dir: Path):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plot RGAE-v2 effective rollout selection curves.")
+    parser = argparse.ArgumentParser(description="Plot RGAE effective rollout selection ablation curves.")
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--eval-freq", type=int, default=10)
@@ -59,10 +59,10 @@ def main() -> None:
     print(f"saved: {csv_path}")
 
     specs = [
-        ("best_of_8_objective.png", "best_of_8", "objective", "Objective (-100 * eval reward, lower is better)", "RGAE-v2 Best-of-8 Objective", (900, 1050)),
-        ("trajectory_avg_objective.png", "trajectory_avg", "objective", "Objective (-100 * eval reward, lower is better)", "RGAE-v2 Trajectory-Average Objective", (980, 1120)),
-        ("best_of_8_avg_cs.png", "best_of_8", "avg_cs", "Average charging station visits", "RGAE-v2 Best-of-8 CS Usage", None),
-        ("trajectory_avg_avg_cs.png", "trajectory_avg", "avg_cs", "Average charging station visits", "RGAE-v2 Trajectory-Average CS Usage", None),
+        ("best_of_8_objective.png", "best_of_8", "objective", "Objective (-100 * eval reward, lower is better)", "RGAE Effective Selection Best-of-8 Objective", (900, 1050)),
+        ("trajectory_avg_objective.png", "trajectory_avg", "objective", "Objective (-100 * eval reward, lower is better)", "RGAE Effective Selection Trajectory-Average Objective", (980, 1120)),
+        ("best_of_8_avg_cs.png", "best_of_8", "avg_cs", "Average charging station visits", "RGAE Effective Selection Best-of-8 CS Usage", None),
+        ("trajectory_avg_avg_cs.png", "trajectory_avg", "avg_cs", "Average charging station visits", "RGAE Effective Selection Trajectory-Average CS Usage", None),
     ]
     for filename, aggregation, metric, ylabel, title, zoom in specs:
         out = out_dir / filename

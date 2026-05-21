@@ -1,0 +1,6 @@
+gpu0_p3_exp3_softgate_sym_seed3006_u300 pid=210897 gpu=0 log=/data/Maojie/Github2/OFFLINE2ONLINE/Ablation/LOGS/rgae_p3_asymclip_seed3006_u300/gpu0_p3_exp3_softgate_sym_seed3006_u300.txt
+gpu1_p3_exp3_asym30_seed3006_u300 pid=211092 gpu=1 log=/data/Maojie/Github2/OFFLINE2ONLINE/Ablation/LOGS/rgae_p3_asymclip_seed3006_u300/gpu1_p3_exp3_asym30_seed3006_u300.txt
+gpu2_p3_exp3_asym40_seed3006_u300 pid=211256 gpu=2 log=/data/Maojie/Github2/OFFLINE2ONLINE/Ablation/LOGS/rgae_p3_asymclip_seed3006_u300/gpu2_p3_exp3_asym40_seed3006_u300.txt
+gpu3_p3_exp3_archive_asym40_seed3006_u300 pid=211420 gpu=3 log=/data/Maojie/Github2/OFFLINE2ONLINE/Ablation/LOGS/rgae_p3_asymclip_seed3006_u300/gpu3_p3_exp3_archive_asym40_seed3006_u300.txt
+wrote /data/Maojie/Github2/OFFLINE2ONLINE/Ablation/LOGS/rgae_p3_asymclip_seed3006_u300/run_metadata.json
+wrote /data/Maojie/Github2/OFFLINE2ONLINE/Ablation/LOGS/rgae_p3_asymclip_seed3006_u300/pids.json

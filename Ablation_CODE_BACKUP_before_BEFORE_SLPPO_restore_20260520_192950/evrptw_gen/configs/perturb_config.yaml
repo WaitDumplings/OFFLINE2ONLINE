@@ -1,0 +1,10 @@
+perturb:
+  area_size: False
+  speed: true
+  working_endTime: true
+  battery_capacity: true
+  consumption_per_distance: true
+  loading_capacity: true
+  charging_speed: true
+  num_cluster: true
+  charging_efficiency: False
